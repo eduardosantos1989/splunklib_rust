@@ -319,10 +319,3 @@ See `src/main.rs` for a complete example demonstrating file logger usage.
 cargo test
 ```
 
-## License
-
-[Specify your license here]
-
-## Contributing
-
-[Specify contribution guidelines here]
