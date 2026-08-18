@@ -41,6 +41,33 @@ pub enum SplunkError {
 
 pub type Result<T> = std::result::Result<T, SplunkError>;
 
+/// How log/event payloads are encoded and authenticated on the wire.
+///
+/// * [`IngestMode::SplunkHec`] — Splunk HTTP Event Collector: optional
+///   `Authorization: Splunk <token>` header and concatenated HEC envelopes.
+/// * [`IngestMode::Custom`] — custom collector used by some internal
+///   endpoints: **no auth**, JSON array body, metadata as query parameters
+///   (the historical `send_events` format).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IngestMode {
+    /// Standard Splunk HEC (`/services/collector/event`).
+    SplunkHec,
+    /// Custom HTTP collector (JSON array, query-string metadata, no auth).
+    #[default]
+    Custom,
+}
+
+impl IngestMode {
+    /// Parse `hec` / `splunk_hec` / `custom` (case-insensitive).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "hec" | "splunk" | "splunk_hec" | "splunkhec" | "event" => Some(Self::SplunkHec),
+            "custom" | "legacy" | "array" | "json_array" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+}
+
 /// Event metadata for Splunk indexing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventMetadata {
@@ -102,6 +129,32 @@ impl HecEvent {
             fields: None,
         }
     }
+}
+
+/// Wrap raw JSON events as Splunk HEC envelopes using `metadata`.
+///
+/// When an event object contains a numeric `time` field, that value is copied
+/// onto the envelope.
+pub fn wrap_events_as_hec(metadata: &EventMetadata, events: &[JsonValue]) -> Vec<HecEvent> {
+    events
+        .iter()
+        .cloned()
+        .map(|event| {
+            let time = event
+                .get("time")
+                .and_then(JsonValue::as_u64)
+                .or(metadata.time);
+            HecEvent {
+                time,
+                host: Some(Arc::clone(&metadata.host)),
+                source: Some(Arc::clone(&metadata.source)),
+                sourcetype: Some(Arc::clone(&metadata.sourcetype)),
+                index: Some(Arc::clone(&metadata.index)),
+                event,
+                fields: None,
+            }
+        })
+        .collect()
 }
 
 /// Debug configuration options
@@ -184,6 +237,8 @@ pub struct HttpEventSender {
     logger: Arc<dyn Logger>,
     gzip_enabled: Arc<RwLock<bool>>,
     gzip_min_bytes: Arc<RwLock<usize>>,
+    request_timeout: Duration,
+    ingest_mode: Arc<RwLock<IngestMode>>,
     // Connection pooling and caching
     response_cache: ResponseCache,
 }
@@ -213,8 +268,29 @@ impl HttpEventSender {
             logger: Arc::new(StderrLogger),
             gzip_enabled: Arc::new(RwLock::new(false)),
             gzip_min_bytes: Arc::new(RwLock::new(1024)),
+            request_timeout: Duration::from_secs(30),
+            ingest_mode: Arc::new(RwLock::new(IngestMode::Custom)),
             response_cache: DashMap::new(),
         })
+    }
+
+    /// Set the ingest encoding/auth mode used by [`Self::send_json_events`].
+    pub async fn set_ingest_mode(&self, mode: IngestMode) {
+        *self.ingest_mode.write().await = mode;
+    }
+
+    /// Current ingest mode.
+    pub async fn ingest_mode(&self) -> IngestMode {
+        *self.ingest_mode.read().await
+    }
+
+    /// Add a Splunk HEC token as `Authorization: Splunk <token>`.
+    pub async fn set_hec_token(&self, token: impl AsRef<str>) {
+        self.add_extra_header(
+            "Authorization".to_string(),
+            format!("Splunk {}", token.as_ref()),
+        )
+        .await;
     }
 
     /// Set extra headers (replaces all existing extra headers)
@@ -536,7 +612,7 @@ impl HttpEventSender {
             .body(body_data);
 
         // Add timeout if configured
-        request_builder = request_builder.timeout(Duration::from_secs(30));
+        request_builder = request_builder.timeout(self.request_timeout);
 
         let response = request_builder.send().await?;
         let status_code = response.status().as_u16();
@@ -656,6 +732,35 @@ impl HttpEventSender {
         serde_json::to_writer(&mut buf, event_payloads)?;
         let bytes = Bytes::from(buf);
         self.do_send(metadata, bytes, true).await
+    }
+
+    /// Send JSON events using the sender's current [`IngestMode`].
+    ///
+    /// * [`IngestMode::Custom`] — JSON array + query metadata, no HEC envelope
+    /// * [`IngestMode::SplunkHec`] — concatenated HEC envelopes to the base URL
+    pub async fn send_json_events(
+        &self,
+        metadata: &EventMetadata,
+        events: &[JsonValue],
+    ) -> Result<(u16, String)> {
+        let mode = *self.ingest_mode.read().await;
+        self.send_json_events_with(mode, metadata, events).await
+    }
+
+    /// Send JSON events using an explicit [`IngestMode`].
+    pub async fn send_json_events_with(
+        &self,
+        mode: IngestMode,
+        metadata: &EventMetadata,
+        events: &[JsonValue],
+    ) -> Result<(u16, String)> {
+        match mode {
+            IngestMode::Custom => self.send_events(metadata, events).await,
+            IngestMode::SplunkHec => {
+                let wrapped = wrap_events_as_hec(metadata, events);
+                self.send_hec_batch(&wrapped).await
+            }
+        }
     }
 
     /// Batch send multiple events with automatic chunking
@@ -795,6 +900,8 @@ pub struct HttpEventSenderBuilder {
     debug_options: DebugOptions,
     extra_headers: Vec<(String, String)>,
     logger: Option<Arc<dyn Logger>>,
+    ingest_mode: IngestMode,
+    hec_token: Option<String>,
 }
 
 impl HttpEventSenderBuilder {
@@ -809,6 +916,8 @@ impl HttpEventSenderBuilder {
             debug_options: DebugOptions::default(),
             extra_headers: Vec::new(),
             logger: None,
+            ingest_mode: IngestMode::Custom,
+            hec_token: None,
         }
     }
 
@@ -848,6 +957,18 @@ impl HttpEventSenderBuilder {
         self
     }
 
+    /// Select Splunk HEC vs the custom JSON-array collector.
+    pub fn ingest_mode(mut self, mode: IngestMode) -> Self {
+        self.ingest_mode = mode;
+        self
+    }
+
+    /// Splunk HEC token. Applied only when [`IngestMode::SplunkHec`] is selected.
+    pub fn hec_token(mut self, token: impl Into<String>) -> Self {
+        self.hec_token = Some(token.into());
+        self
+    }
+
     pub async fn build(self) -> Result<HttpEventSender> {
         let base_url = Url::parse(&self.url)?;
 
@@ -862,11 +983,18 @@ impl HttpEventSenderBuilder {
             .user_agent("SplunkEventSender-Rust/1.0")
             .build()?;
 
+        let mut extra_headers = self.extra_headers;
+        if self.ingest_mode == IngestMode::SplunkHec
+            && let Some(token) = &self.hec_token
+        {
+            extra_headers.push(("Authorization".to_string(), format!("Splunk {token}")));
+        }
+
         let sender = HttpEventSender {
             client,
             base_url,
             extra_headers: Arc::new(RwLock::new(
-                self.extra_headers
+                extra_headers
                     .into_iter()
                     .map(|(k, v)| (k.into(), v.into()))
                     .collect(),
@@ -877,6 +1005,8 @@ impl HttpEventSenderBuilder {
             logger: self.logger.unwrap_or_else(|| Arc::new(StderrLogger)),
             gzip_enabled: Arc::new(RwLock::new(self.gzip_enabled)),
             gzip_min_bytes: Arc::new(RwLock::new(self.gzip_min_bytes)),
+            request_timeout: self.request_timeout,
+            ingest_mode: Arc::new(RwLock::new(self.ingest_mode)),
             response_cache: DashMap::new(),
         };
 
@@ -921,5 +1051,23 @@ mod tests {
             std::str::from_utf8(payload.as_ref()).unwrap(),
             r#"{"a":1}{"b":2}"#
         );
+    }
+
+    #[test]
+    fn ingest_mode_parse_accepts_aliases() {
+        assert_eq!(IngestMode::parse("hec"), Some(IngestMode::SplunkHec));
+        assert_eq!(IngestMode::parse("CUSTOM"), Some(IngestMode::Custom));
+        assert_eq!(IngestMode::parse("nope"), None);
+    }
+
+    #[test]
+    fn wrap_events_as_hec_copies_metadata_and_event_time() {
+        let metadata = EventMetadata::new("main", "src", "_json", "idx-01");
+        let events = vec![json!({"time": 99, "message": "hi"})];
+        let wrapped = wrap_events_as_hec(&metadata, &events);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped[0].time, Some(99));
+        assert_eq!(wrapped[0].index.as_deref(), Some("main"));
+        assert_eq!(wrapped[0].event["message"], "hi");
     }
 }

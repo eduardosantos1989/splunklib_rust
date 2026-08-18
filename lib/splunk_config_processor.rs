@@ -169,9 +169,10 @@ impl LRUCache {
         // Read from environment with proper validation
         if let Ok(val) = env::var("BUNDLETRACKER_CACHE_SIZE_MB")
             && let Ok(mb) = val.parse::<usize>()
-                && mb > 0 {
-                    max_size = mb_to_bytes_safe(mb);
-                }
+            && mb > 0
+        {
+            max_size = mb_to_bytes_safe(mb);
+        }
 
         // Leak the sentinel nodes so they live for the static lifetime
         let head_ptr = NonNull::from(Box::leak(head));
@@ -416,9 +417,10 @@ pub fn get_version<P: AsRef<Path>>(path: P) -> String {
     for line in content.lines() {
         let trimmed = trim(line);
         if trimmed.starts_with("VERSION")
-            && let Some(eq_pos) = trimmed.find('=') {
-                return trim(&trimmed[eq_pos + 1..]).to_string();
-            }
+            && let Some(eq_pos) = trimmed.find('=')
+        {
+            return trim(&trimmed[eq_pos + 1..]).to_string();
+        }
     }
 
     String::new()
@@ -612,7 +614,7 @@ pub fn parse_config(content: &str, _file_path: &str) -> SplunkConfigDoc {
             } else {
                 // Orphaned line
             }
-        } 
+        }
     }
 
     add_entry(
@@ -628,12 +630,24 @@ pub fn parse_config(content: &str, _file_path: &str) -> SplunkConfigDoc {
     doc
 }
 
-// ===== High-level: read multiple files and merge (earlier files dominate) =====
+// ===== High-level: read multiple files and merge =====
+
+/// How duplicate stanza/key pairs are resolved when merging conf files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergePrecedence {
+    /// First file (and first key in a file) wins. Useful when callers put
+    /// `local/` paths before `default/` paths.
+    FirstWins,
+    /// Last file (and last key in a file) wins. This matches Splunk btool:
+    /// `default/` is applied first, then `local/` overlays it.
+    LastWins,
+}
 
 /// Read and merge configuration from multiple files.
 ///
 /// Earlier files in the list take precedence over later ones.
-/// This matches Splunk's behavior where local/ overrides default/.
+/// Prefer [`read_configs_last_wins`] or [`crate::splunk_conf_layering`] when you
+/// want Splunk's real default-then-local overlay.
 ///
 /// # Arguments
 ///
@@ -643,8 +657,20 @@ pub fn parse_config(content: &str, _file_path: &str) -> SplunkConfigDoc {
 ///
 /// A merged dictionary of all configuration values
 pub fn read_configs<P: AsRef<Path>>(files: &[P]) -> Dictionary {
+    merge_configs(files, MergePrecedence::FirstWins)
+}
+
+/// Read and merge configuration from multiple files, last file winning.
+///
+/// Pass files in Splunk layer order (system default → app default → system
+/// local → app local → user) so later layers override earlier ones.
+pub fn read_configs_last_wins<P: AsRef<Path>>(files: &[P]) -> Dictionary {
+    merge_configs(files, MergePrecedence::LastWins)
+}
+
+/// Merge configuration files using the given duplicate-key precedence.
+pub fn merge_configs<P: AsRef<Path>>(files: &[P], precedence: MergePrecedence) -> Dictionary {
     let mut dict: Dictionary = HashMap::new();
-    // Ensure default stanza exists
     dict.insert("default".to_string(), HashMap::new());
 
     for path in files {
@@ -659,8 +685,14 @@ pub fn read_configs<P: AsRef<Path>>(files: &[P]) -> Dictionary {
         for stanza in doc {
             let stanza_map = dict.entry(stanza.name).or_default();
             for entry in stanza.entries {
-                // Earlier files dominate: only insert if absent
-                stanza_map.entry(entry.key).or_insert(entry.value);
+                match precedence {
+                    MergePrecedence::FirstWins => {
+                        stanza_map.entry(entry.key).or_insert(entry.value);
+                    }
+                    MergePrecedence::LastWins => {
+                        stanza_map.insert(entry.key, entry.value);
+                    }
+                }
             }
         }
     }
@@ -673,4 +705,63 @@ pub fn read_configs<P: AsRef<Path>>(files: &[P]) -> Dictionary {
 /// Alias for [`read_configs`] for API compatibility.
 pub fn read_configs_default<P: AsRef<Path>>(files: &[P]) -> Dictionary {
     read_configs(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_config_handles_comments_stanzas_and_multiline() {
+        let doc = parse_config(
+            r#"
+# comment
+; also a comment
+[default]
+host = indexer.example
+banner = hello \
+world
+
+[monitor:///var/log/app.log]
+index = main
+"#,
+            "inputs.conf",
+        );
+
+        let default = doc.iter().find(|s| s.name == "default").unwrap();
+        assert!(
+            default
+                .entries
+                .iter()
+                .any(|e| e.key == "host" && e.value == "indexer.example")
+        );
+        let banner = default.entries.iter().find(|e| e.key == "banner").unwrap();
+        assert!(banner.value.contains("hello"));
+        assert!(banner.value.contains("world"));
+
+        let monitor = doc
+            .iter()
+            .find(|s| s.name == "monitor:///var/log/app.log")
+            .unwrap();
+        assert_eq!(monitor.entries[0].key, "index");
+        assert_eq!(monitor.entries[0].value, "main");
+    }
+
+    #[test]
+    fn merge_configs_first_and_last_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.conf");
+        let second = dir.path().join("second.conf");
+        fs::write(&first, "[default]\nhost = first\nindex = keep\n").unwrap();
+        fs::write(&second, "[default]\nhost = second\n").unwrap();
+
+        let files = [first, second];
+        let first_wins = merge_configs(&files, MergePrecedence::FirstWins);
+        let last_wins = merge_configs(&files, MergePrecedence::LastWins);
+
+        assert_eq!(first_wins["default"]["host"], "first");
+        assert_eq!(first_wins["default"]["index"], "keep");
+        assert_eq!(last_wins["default"]["host"], "second");
+        assert_eq!(last_wins["default"]["index"], "keep");
+    }
 }

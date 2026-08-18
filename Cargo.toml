@@ -1,7 +1,10 @@
 [package]
 name = "splunklib_rust"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
+
+[dev-dependencies]
+tempfile = "3.23.0"
 
 [lib]
 path = "lib/mod.rs"
