@@ -239,6 +239,7 @@ pub struct HttpEventSender {
     gzip_min_bytes: Arc<RwLock<usize>>,
     request_timeout: Duration,
     ingest_mode: Arc<RwLock<IngestMode>>,
+    hec_token: Arc<RwLock<Option<String>>>,
     // Connection pooling and caching
     response_cache: ResponseCache,
 }
@@ -270,11 +271,15 @@ impl HttpEventSender {
             gzip_min_bytes: Arc::new(RwLock::new(1024)),
             request_timeout: Duration::from_secs(30),
             ingest_mode: Arc::new(RwLock::new(IngestMode::Custom)),
+            hec_token: Arc::new(RwLock::new(None)),
             response_cache: DashMap::new(),
         })
     }
 
     /// Set the ingest encoding/auth mode used by [`Self::send_json_events`].
+    ///
+    /// Switching to [`IngestMode::Custom`] stops attaching the HEC token; the
+    /// token is kept and reused if the mode is switched back to Splunk HEC.
     pub async fn set_ingest_mode(&self, mode: IngestMode) {
         *self.ingest_mode.write().await = mode;
     }
@@ -284,13 +289,9 @@ impl HttpEventSender {
         *self.ingest_mode.read().await
     }
 
-    /// Add a Splunk HEC token as `Authorization: Splunk <token>`.
+    /// Store a Splunk HEC token. It is sent only with HEC-format requests.
     pub async fn set_hec_token(&self, token: impl AsRef<str>) {
-        self.add_extra_header(
-            "Authorization".to_string(),
-            format!("Splunk {}", token.as_ref()),
-        )
-        .await;
+        *self.hec_token.write().await = Some(token.as_ref().to_string());
     }
 
     /// Set extra headers (replaces all existing extra headers)
@@ -418,11 +419,15 @@ impl HttpEventSender {
         Ok(())
     }
 
-    /// Get appropriate headers for request
+    /// Get appropriate headers for request.
+    ///
+    /// `include_hec_auth` attaches `Authorization: Splunk <token>` when a HEC
+    /// token is stored. Custom ingest requests must pass `false`.
     async fn get_headers(
         &self,
         want_json_content_type: bool,
         want_gzip_encoding: bool,
+        include_hec_auth: bool,
     ) -> Result<reqwest::header::HeaderMap> {
         self.rebuild_header_cache_if_dirty().await?;
 
@@ -433,8 +438,21 @@ impl HttpEventSender {
             (false, true) => &cache.base_gzip,
             (false, false) => &cache.base,
         };
+        let mut headers = headers.clone();
+        if include_hec_auth
+            && let Some(token) = self.hec_token.read().await.as_ref()
+            && !headers.contains_key(reqwest::header::AUTHORIZATION)
+        {
+            let value = format!("Splunk {token}");
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&value).map_err(|e| {
+                    SplunkError::ConfigError(format!("Invalid HEC token header: {e}"))
+                })?,
+            );
+        }
 
-        Ok(headers.clone())
+        Ok(headers)
     }
 
     /// Compress data using gzip
@@ -506,6 +524,7 @@ impl HttpEventSender {
         url: Url,
         payload: P,
         is_json_payload: bool,
+        include_hec_auth: bool,
     ) -> Result<(u16, String)>
     where
         P: Into<Bytes>,
@@ -557,7 +576,7 @@ impl HttpEventSender {
 
         // Get appropriate headers
         let headers = self
-            .get_headers(is_json_payload, compressed_size.is_some())
+            .get_headers(is_json_payload, compressed_size.is_some(), include_hec_auth)
             .await?;
 
         // Debug logging for request
@@ -667,7 +686,8 @@ impl HttpEventSender {
         P: Into<Bytes>,
     {
         let url = self.build_url(metadata)?;
-        self.do_send_to_url(url, payload, is_json_payload).await
+        self.do_send_to_url(url, payload, is_json_payload, false)
+            .await
     }
 
     /// Send events as delimited string
@@ -827,7 +847,7 @@ impl HttpEventSender {
         }
 
         let bytes = Self::encode_hec_payload(events)?;
-        self.do_send_to_url(self.base_url.clone(), bytes, true)
+        self.do_send_to_url(self.base_url.clone(), bytes, true, true)
             .await
     }
 
@@ -963,7 +983,8 @@ impl HttpEventSenderBuilder {
         self
     }
 
-    /// Splunk HEC token. Applied only when [`IngestMode::SplunkHec`] is selected.
+    /// Splunk HEC token. Attached only on HEC-format requests, never on
+    /// [`IngestMode::Custom`] sends.
     pub fn hec_token(mut self, token: impl Into<String>) -> Self {
         self.hec_token = Some(token.into());
         self
@@ -983,12 +1004,7 @@ impl HttpEventSenderBuilder {
             .user_agent("SplunkEventSender-Rust/1.0")
             .build()?;
 
-        let mut extra_headers = self.extra_headers;
-        if self.ingest_mode == IngestMode::SplunkHec
-            && let Some(token) = &self.hec_token
-        {
-            extra_headers.push(("Authorization".to_string(), format!("Splunk {token}")));
-        }
+        let extra_headers = self.extra_headers;
 
         let sender = HttpEventSender {
             client,
@@ -1007,6 +1023,7 @@ impl HttpEventSenderBuilder {
             gzip_min_bytes: Arc::new(RwLock::new(self.gzip_min_bytes)),
             request_timeout: self.request_timeout,
             ingest_mode: Arc::new(RwLock::new(self.ingest_mode)),
+            hec_token: Arc::new(RwLock::new(self.hec_token)),
             response_cache: DashMap::new(),
         };
 
@@ -1069,5 +1086,32 @@ mod tests {
         assert_eq!(wrapped[0].time, Some(99));
         assert_eq!(wrapped[0].index.as_deref(), Some("main"));
         assert_eq!(wrapped[0].event["message"], "hi");
+    }
+
+    #[tokio::test]
+    async fn hec_token_is_only_attached_for_hec_requests() {
+        let sender = HttpEventSenderBuilder::new("http://example.com/collector")
+            .ingest_mode(IngestMode::Custom)
+            .hec_token("secret-token")
+            .build()
+            .await
+            .unwrap();
+
+        let custom = sender.get_headers(true, false, false).await.unwrap();
+        assert!(
+            custom.get(reqwest::header::AUTHORIZATION).is_none(),
+            "custom ingest must not send the HEC token"
+        );
+
+        let hec = sender.get_headers(true, false, true).await.unwrap();
+        assert_eq!(
+            hec.get(reqwest::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Splunk secret-token")
+        );
+
+        sender.set_ingest_mode(IngestMode::Custom).await;
+        let still_custom = sender.get_headers(true, false, false).await.unwrap();
+        assert!(still_custom.get(reqwest::header::AUTHORIZATION).is_none());
     }
 }

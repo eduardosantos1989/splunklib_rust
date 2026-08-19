@@ -40,20 +40,29 @@ pub fn try_get_splunk_hostname(splunk_root: &Path) -> io::Result<String> {
     let ctx = ConfContext::from_splunk_home(splunk_root);
 
     let inputs = read_layered_conf(&ctx, "inputs.conf")?;
-    if let Some(host) = inputs.value("default", "host")
-        && !host.is_empty()
+    if let Some(host) = inputs
+        .value("default", "host")
+        .filter(|h| is_usable_hostname(h))
     {
         return Ok(host.to_string());
     }
 
     let server = read_layered_conf(&ctx, "server.conf")?;
-    if let Some(server_name) = server.value("general", "serverName")
-        && !server_name.is_empty()
+    if let Some(server_name) = server
+        .value("general", "serverName")
+        .filter(|h| is_usable_hostname(h))
     {
         return Ok(server_name.to_string());
     }
 
     Ok(get_os_hostname())
+}
+
+fn is_usable_hostname(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && !trimmed.eq_ignore_ascii_case("$decideOnStartup")
+        && trimmed != "${decideOnStartup}"
 }
 
 /// Get the system hostname using the OS hostname facility.
@@ -103,5 +112,28 @@ mod tests {
 
         let hostname = try_get_splunk_hostname(dir.path()).unwrap();
         assert_eq!(hostname, "idx-01");
+    }
+
+    #[test]
+    fn decide_on_startup_is_not_returned_as_hostname() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_dir = dir.path().join("etc/system/default");
+        fs::create_dir_all(&default_dir).unwrap();
+        fs::write(
+            default_dir.join("inputs.conf"),
+            "[default]\nhost = $decideOnStartup\n",
+        )
+        .unwrap();
+        fs::write(
+            default_dir.join("server.conf"),
+            "[general]\nserverName = idx-from-server\n",
+        )
+        .unwrap();
+
+        let hostname = try_get_splunk_hostname(dir.path()).unwrap();
+        assert_ne!(hostname, "$decideOnStartup");
+        // Expanded sentinel becomes the OS hostname; serverName is only used
+        // when host is unset.
+        assert_eq!(hostname, get_os_hostname());
     }
 }

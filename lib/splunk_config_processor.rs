@@ -8,7 +8,7 @@
 
 use std::{
     collections::HashMap,
-    env, fs,
+    env, fs, io,
     path::Path,
     ptr::NonNull,
     sync::{
@@ -662,13 +662,16 @@ pub fn read_configs<P: AsRef<Path>>(files: &[P]) -> Dictionary {
 
 /// Read and merge configuration from multiple files, last file winning.
 ///
-/// Pass files in Splunk layer order (system default → app default → system
-/// local → app local → user) so later layers override earlier ones.
+/// Pass files in Splunk layer order (system default → app default →
+/// app local → system local → optional user) so later layers override earlier ones.
 pub fn read_configs_last_wins<P: AsRef<Path>>(files: &[P]) -> Dictionary {
     merge_configs(files, MergePrecedence::LastWins)
 }
 
 /// Merge configuration files using the given duplicate-key precedence.
+///
+/// Missing or unreadable files are skipped (empty content). Prefer
+/// [`merge_configs_strict`] when I/O errors must surface.
 pub fn merge_configs<P: AsRef<Path>>(files: &[P], precedence: MergePrecedence) -> Dictionary {
     let mut dict: Dictionary = HashMap::new();
     dict.insert("default".to_string(), HashMap::new());
@@ -698,6 +701,37 @@ pub fn merge_configs<P: AsRef<Path>>(files: &[P], precedence: MergePrecedence) -
     }
 
     dict
+}
+
+/// Merge configuration files, returning the first non-success I/O error.
+pub fn merge_configs_strict<P: AsRef<Path>>(
+    files: &[P],
+    precedence: MergePrecedence,
+) -> io::Result<Dictionary> {
+    let mut dict: Dictionary = HashMap::new();
+    dict.insert("default".to_string(), HashMap::new());
+
+    for path in files {
+        let content = fs::read_to_string(path)?;
+        let file_path_str = path.as_ref().to_string_lossy();
+        let doc = parse_config(&content, &file_path_str);
+
+        for stanza in doc {
+            let stanza_map = dict.entry(stanza.name).or_default();
+            for entry in stanza.entries {
+                match precedence {
+                    MergePrecedence::FirstWins => {
+                        stanza_map.entry(entry.key).or_insert(entry.value);
+                    }
+                    MergePrecedence::LastWins => {
+                        stanza_map.insert(entry.key, entry.value);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(dict)
 }
 
 /// Convenience wrapper for reading configuration files.

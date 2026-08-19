@@ -16,7 +16,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(not(target_has_atomic = "64"))]
 use portable_atomic::AtomicU64;
@@ -43,6 +43,8 @@ pub enum JsonLoggerError {
     NoDestination,
     #[error("invalid log url: {0}")]
     InvalidUrl(String),
+    #[error("http logger setup failed: {0}")]
+    HttpSetup(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
@@ -307,8 +309,13 @@ fn select_logging_stanza(dict: &Dictionary) -> Option<&MapLike> {
     if let Some(stanza) = dict.get("http") {
         return Some(stanza);
     }
-    if let Some((_, stanza)) = dict.iter().find(|(name, _)| name.starts_with("http::")) {
-        return Some(stanza);
+    let mut http_stanzas: Vec<&String> = dict
+        .keys()
+        .filter(|name| name.starts_with("http::"))
+        .collect();
+    http_stanzas.sort();
+    if let Some(name) = http_stanzas.first() {
+        return dict.get(*name);
     }
     dict.get("default")
 }
@@ -343,6 +350,7 @@ pub struct JsonLogger {
 
 struct JsonLoggerInner {
     command_tx: Sender<Command>,
+    command_lock: Mutex<()>,
     join: Mutex<Option<JoinHandle<JsonLoggerStats>>>,
     shutdown: AtomicBool,
     final_stats: Mutex<Option<JsonLoggerStats>>,
@@ -367,11 +375,27 @@ impl JsonLogger {
             config.http = None;
         }
 
-        if config.http.is_none() && config.file.is_none() {
+        let http_runtime = if let Some(http_cfg) = &config.http {
+            match build_http_runtime_on_thread(http_cfg) {
+                Ok(runtime) => Some(runtime),
+                Err(err) => {
+                    if config.file.is_none() {
+                        return Err(JsonLoggerError::HttpSetup(err));
+                    }
+                    warn!("HTTP logger setup failed ({err}); falling back to file");
+                    config.http = None;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if http_runtime.is_none() && config.file.is_none() {
             return Err(JsonLoggerError::NoDestination);
         }
 
-        let destination = match (&config.http, &config.file) {
+        let destination = match (&http_runtime, &config.file) {
             (Some(_), Some(_)) => LogDestination::HttpWithFileFallback,
             (Some(_), None) => LogDestination::Http,
             (None, Some(_)) => LogDestination::File,
@@ -397,12 +421,13 @@ impl JsonLogger {
 
         let handle = thread::Builder::new()
             .name("splunk-json-logger".into())
-            .spawn(move || worker_loop(command_rx, config, file_logger, destination))
+            .spawn(move || worker_loop(command_rx, config, http_runtime, file_logger, destination))
             .map_err(JsonLoggerError::Io)?;
 
         Ok(Self {
             inner: Arc::new(JsonLoggerInner {
                 command_tx,
+                command_lock: Mutex::new(()),
                 join: Mutex::new(Some(handle)),
                 shutdown: AtomicBool::new(false),
                 final_stats: Mutex::new(None),
@@ -507,24 +532,31 @@ impl JsonLogger {
     }
 
     pub fn shutdown(&self) -> Result<JsonLoggerStats> {
-        if self.inner.shutdown.swap(true, Ordering::SeqCst) {
-            if let Some(stats) = self
-                .inner
-                .final_stats
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-            {
-                return Ok(stats);
-            }
-            return Err(JsonLoggerError::Disconnected);
-        }
-
         let (tx, rx) = bounded(1);
-        self.inner
-            .command_tx
-            .send(Command::Shutdown(tx))
-            .map_err(|_| JsonLoggerError::Disconnected)?;
+        {
+            let _guard = self
+                .inner
+                .command_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if self.inner.shutdown.swap(true, Ordering::SeqCst) {
+                drop(_guard);
+                if let Some(stats) = self
+                    .inner
+                    .final_stats
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                {
+                    return Ok(stats);
+                }
+                return Err(JsonLoggerError::Disconnected);
+            }
+            self.inner
+                .command_tx
+                .send(Command::Shutdown(tx))
+                .map_err(|_| JsonLoggerError::Disconnected)?;
+        }
         let final_stats = rx.recv().map_err(|_| JsonLoggerError::Disconnected)?;
 
         let mut join_guard = self.inner.join.lock().unwrap_or_else(|e| e.into_inner());
@@ -553,6 +585,11 @@ impl JsonLogger {
     }
 
     fn send_command(&self, command: Command) -> Result<()> {
+        let _guard = self
+            .inner
+            .command_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if self.inner.shutdown.load(Ordering::SeqCst) {
             return Err(JsonLoggerError::ShuttingDown);
         }
@@ -563,6 +600,11 @@ impl JsonLogger {
     }
 
     fn try_send_command(&self, command: Command) -> Result<()> {
+        let _guard = self
+            .inner
+            .command_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if self.inner.shutdown.load(Ordering::SeqCst) {
             return Err(JsonLoggerError::ShuttingDown);
         }
@@ -626,15 +668,34 @@ fn normalize_record(value: JsonValue, sid: u64) -> JsonValue {
     }
 }
 
-fn write_ndjson(file: &FileLogger, events: &[JsonValue], stats: &mut JsonLoggerStats) {
+fn write_ndjson(
+    file: &FileLogger,
+    events: &[JsonValue],
+    stats: &mut JsonLoggerStats,
+) -> std::io::Result<()> {
+    let mut first_err: Option<std::io::Error> = None;
     for event in events {
         match serde_json::to_vec(event) {
             Ok(bytes) => match file.log_with_header(bytes, false) {
                 Ok(()) => stats.file_records += 1,
-                Err(err) => stats.last_error = Some(err.to_string()),
+                Err(err) => {
+                    stats.last_error = Some(err.to_string());
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
             },
-            Err(err) => stats.last_error = Some(err.to_string()),
+            Err(err) => {
+                stats.last_error = Some(err.to_string());
+                if first_err.is_none() {
+                    first_err = Some(std::io::Error::other(err.to_string()));
+                }
+            }
         }
+    }
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
 }
 
@@ -645,8 +706,10 @@ struct WorkerCtx {
     mode: IngestMode,
     batch_size: usize,
     auto_flush_interval: Option<Duration>,
+    next_flush: Option<Instant>,
     stats: JsonLoggerStats,
     batch: Vec<JsonValue>,
+    pending_delivery_error: Option<std::io::Error>,
 }
 
 struct HttpRuntime {
@@ -657,33 +720,64 @@ struct HttpRuntime {
 fn worker_loop(
     command_rx: Receiver<Command>,
     config: JsonLoggerConfig,
+    http: Option<HttpRuntime>,
     file: Option<FileLogger>,
     destination: LogDestination,
 ) -> JsonLoggerStats {
-    let mut ctx = match build_worker(config, file, destination) {
-        Ok(ctx) => ctx,
-        Err(err) => {
-            return JsonLoggerStats {
-                records_queued: 0,
-                http_batches_ok: 0,
-                http_batches_failed: 0,
-                file_records: 0,
-                last_error: Some(err),
-                destination,
-            };
-        }
+    let mut ctx = WorkerCtx {
+        http,
+        file,
+        metadata: config
+            .http
+            .as_ref()
+            .map(|h| h.metadata.clone())
+            .unwrap_or_else(|| EventMetadata::new("main", "splunklib_rust", "_json", "localhost")),
+        mode: config
+            .http
+            .as_ref()
+            .map(|h| h.mode)
+            .unwrap_or(IngestMode::Custom),
+        batch_size: config.batch_size.max(1),
+        auto_flush_interval: config.auto_flush_interval,
+        next_flush: config
+            .auto_flush_interval
+            .map(|interval| Instant::now() + interval),
+        stats: JsonLoggerStats {
+            records_queued: 0,
+            http_batches_ok: 0,
+            http_batches_failed: 0,
+            file_records: 0,
+            last_error: None,
+            destination,
+        },
+        batch: Vec::new(),
+        pending_delivery_error: None,
     };
 
     loop {
         let command = match ctx.auto_flush_interval {
-            Some(interval) => match command_rx.recv_timeout(interval) {
-                Ok(command) => command,
-                Err(RecvTimeoutError::Timeout) => {
-                    flush_batch(&mut ctx);
-                    continue;
+            Some(_) => {
+                let timeout = ctx
+                    .next_flush
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or(Duration::ZERO);
+                match command_rx.recv_timeout(timeout) {
+                    Ok(command) => command,
+                    Err(RecvTimeoutError::Timeout) => {
+                        let _ = flush_batch(&mut ctx);
+                        if let Some(file) = &ctx.file
+                            && let Err(err) = file.flush()
+                        {
+                            ctx.stats.last_error = Some(err.to_string());
+                        }
+                        if let Some(interval) = ctx.auto_flush_interval {
+                            ctx.next_flush = Some(Instant::now() + interval);
+                        }
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
-            },
+            }
             None => match command_rx.recv() {
                 Ok(command) => command,
                 Err(_) => break,
@@ -696,26 +790,28 @@ fn worker_loop(
                 if ctx.http.is_some() {
                     ctx.batch.push(value);
                     if ctx.batch.len() >= ctx.batch_size {
-                        flush_batch(&mut ctx);
+                        let _ = flush_batch(&mut ctx);
                     }
                 } else if let Some(file) = &ctx.file {
-                    write_ndjson(file, std::slice::from_ref(&value), &mut ctx.stats);
+                    let _ = write_ndjson(file, std::slice::from_ref(&value), &mut ctx.stats);
                 }
             }
             Command::Flush(reply) => {
-                flush_batch(&mut ctx);
-                let result = if let Some(file) = &ctx.file {
-                    file.flush()
-                } else {
-                    Ok(())
-                };
+                let mut result = flush_batch(&mut ctx);
+                if result.is_ok() {
+                    if let Some(err) = ctx.pending_delivery_error.take() {
+                        result = Err(err);
+                    } else if let Some(file) = &ctx.file {
+                        result = file.flush();
+                    }
+                }
                 let _ = reply.send(result);
             }
             Command::Stats(reply) => {
                 let _ = reply.send(ctx.stats.clone());
             }
             Command::Shutdown(reply) => {
-                flush_batch(&mut ctx);
+                let _ = flush_batch(&mut ctx);
                 if let Some(file) = &ctx.file {
                     let _ = file.flush();
                     let _ = file.shutdown();
@@ -726,7 +822,7 @@ fn worker_loop(
         }
     }
 
-    flush_batch(&mut ctx);
+    let _ = flush_batch(&mut ctx);
     if let Some(file) = &ctx.file {
         let _ = file.flush();
         let _ = file.shutdown();
@@ -734,67 +830,41 @@ fn worker_loop(
     ctx.stats
 }
 
-fn build_worker(
-    config: JsonLoggerConfig,
-    file: Option<FileLogger>,
-    destination: LogDestination,
-) -> std::result::Result<WorkerCtx, String> {
-    let stats = JsonLoggerStats {
-        records_queued: 0,
-        http_batches_ok: 0,
-        http_batches_failed: 0,
-        file_records: 0,
-        last_error: None,
-        destination,
-    };
-
-    let (http, metadata, mode) = if let Some(http_cfg) = config.http {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?;
-        let mut builder = HttpEventSenderBuilder::new(&http_cfg.url)
-            .verify_ssl(http_cfg.verify_ssl)
-            .connect_timeout(http_cfg.connect_timeout)
-            .request_timeout(http_cfg.request_timeout)
-            .enable_gzip(http_cfg.gzip, 1024)
-            .ingest_mode(http_cfg.mode);
-        if http_cfg.mode == IngestMode::SplunkHec
-            && let Some(token) = &http_cfg.token
-        {
-            builder = builder.hec_token(token.clone());
-        }
-        let sender = runtime
-            .block_on(builder.build())
-            .map_err(|e| e.to_string())?;
-        (
-            Some(HttpRuntime { runtime, sender }),
-            http_cfg.metadata,
-            http_cfg.mode,
-        )
-    } else {
-        (
-            None,
-            EventMetadata::new("main", "splunklib_rust", "_json", "localhost"),
-            IngestMode::Custom,
-        )
-    };
-
-    Ok(WorkerCtx {
-        http,
-        file,
-        metadata,
-        mode,
-        batch_size: config.batch_size.max(1),
-        auto_flush_interval: config.auto_flush_interval,
-        stats,
-        batch: Vec::new(),
-    })
+fn build_http_runtime_on_thread(
+    http_cfg: &HttpLogConfig,
+) -> std::result::Result<HttpRuntime, String> {
+    let cfg = http_cfg.clone();
+    thread::Builder::new()
+        .name("splunk-json-logger-http-setup".into())
+        .spawn(move || build_http_runtime(&cfg))
+        .map_err(|e| e.to_string())?
+        .join()
+        .map_err(|_| "HTTP logger setup thread panicked".to_string())?
 }
 
-fn flush_batch(ctx: &mut WorkerCtx) {
+fn build_http_runtime(http_cfg: &HttpLogConfig) -> std::result::Result<HttpRuntime, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut builder = HttpEventSenderBuilder::new(&http_cfg.url)
+        .verify_ssl(http_cfg.verify_ssl)
+        .connect_timeout(http_cfg.connect_timeout)
+        .request_timeout(http_cfg.request_timeout)
+        .enable_gzip(http_cfg.gzip, 1024)
+        .ingest_mode(http_cfg.mode);
+    if let Some(token) = &http_cfg.token {
+        builder = builder.hec_token(token.clone());
+    }
+    let sender = runtime
+        .block_on(builder.build())
+        .map_err(|e| e.to_string())?;
+    Ok(HttpRuntime { runtime, sender })
+}
+
+fn flush_batch(ctx: &mut WorkerCtx) -> std::io::Result<()> {
     if ctx.batch.is_empty() {
-        return;
+        return Ok(());
     }
     let batch = std::mem::take(&mut ctx.batch);
     if let Some(http) = &ctx.http {
@@ -806,17 +876,26 @@ fn flush_batch(ctx: &mut WorkerCtx) {
         match send_result {
             Ok(_) => {
                 ctx.stats.http_batches_ok += 1;
+                ctx.pending_delivery_error = None;
+                Ok(())
             }
             Err(err) => {
                 ctx.stats.http_batches_failed += 1;
                 ctx.stats.last_error = Some(err.to_string());
                 if let Some(file) = &ctx.file {
-                    write_ndjson(file, &batch, &mut ctx.stats);
+                    ctx.pending_delivery_error = None;
+                    write_ndjson(file, &batch, &mut ctx.stats)
+                } else {
+                    let io_err = std::io::Error::other(err.to_string());
+                    ctx.pending_delivery_error = Some(std::io::Error::other(err.to_string()));
+                    Err(io_err)
                 }
             }
         }
     } else if let Some(file) = &ctx.file {
-        write_ndjson(file, &batch, &mut ctx.stats);
+        write_ndjson(file, &batch, &mut ctx.stats)
+    } else {
+        Err(std::io::Error::other("no log destination available"))
     }
 }
 
@@ -901,6 +980,44 @@ mod tests {
     }
 
     #[test]
+    fn from_dictionary_picks_http_stanzas_in_name_order() {
+        let ctx = ConfContext::from_splunk_home("/opt/splunk");
+        let mut zebra = HashMap::new();
+        zebra.insert("url".into(), "http://zebra.example/".into());
+        let mut alpha = HashMap::new();
+        alpha.insert("url".into(), "http://alpha.example/".into());
+        let mut dict = Dictionary::new();
+        dict.insert("http::zebra".into(), zebra);
+        dict.insert("http::alpha".into(), alpha);
+
+        let cfg = JsonLoggerConfig::from_dictionary(&ctx, &dict);
+        assert_eq!(cfg.http.expect("http").url, "http://alpha.example/");
+    }
+
+    #[test]
+    fn http_only_flush_reports_delivery_failure() {
+        let mut http = HttpLogConfig::new("http://127.0.0.1:1/collector", IngestMode::Custom);
+        http.connect_timeout = Duration::from_millis(200);
+        http.request_timeout = Duration::from_millis(200);
+        let logger = JsonLogger::new(JsonLoggerConfig {
+            http: Some(http),
+            file: None,
+            session_id: Some(1),
+            queue_capacity: Some(16),
+            batch_size: 1,
+            auto_flush_interval: None,
+        })
+        .unwrap();
+        logger.info("lost").unwrap();
+        let err = logger.flush().unwrap_err();
+        assert!(
+            matches!(err, JsonLoggerError::Io(_)),
+            "flush should surface HTTP-only delivery failure, got {err:?}"
+        );
+        let _ = logger.shutdown();
+    }
+
+    #[test]
     fn new_requires_a_destination() {
         let err = JsonLogger::new(JsonLoggerConfig {
             http: None,
@@ -962,7 +1079,11 @@ mod tests {
 
         let url = format!("http://{addr}/services/collector/event");
         let logger = JsonLogger::new(JsonLoggerConfig {
-            http: Some(HttpLogConfig::new(url, IngestMode::Custom)),
+            http: Some(
+                HttpLogConfig::new(url, IngestMode::Custom)
+                    .with_token("must-not-appear")
+                    .verify_ssl(true),
+            ),
             file: None,
             session_id: Some(1),
             queue_capacity: Some(16),

@@ -5,9 +5,9 @@
 //!
 //! 1. `etc/system/default`
 //! 2. `etc/apps/*/default` (then `slave-apps` / `peer-apps`)
-//! 3. `etc/system/local`
-//! 4. `etc/apps/*/local` (then `slave-apps` / `peer-apps`)
-//! 5. `etc/users/*/<app>/local`
+//! 3. `etc/apps/*/local` (then `slave-apps` / `peer-apps`)
+//! 4. `etc/system/local` (highest *global* precedence)
+//! 5. `etc/users/<user>/<app>/local` (only when a user is selected)
 //!
 //! Apps are applied in ASCII name order, with `[install] priority` in `app.conf`
 //! as a tie-break (higher priority is applied later and therefore wins). Apps
@@ -22,7 +22,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::splunk_config_processor::{self, Dictionary, MergePrecedence, read_configs_last_wins};
+use crate::splunk_config_processor::{Dictionary, MergePrecedence, merge_configs_strict};
 
 /// Runtime paths and identity used while reading and expanding conf files.
 #[derive(Debug, Clone)]
@@ -32,6 +32,11 @@ pub struct ConfContext {
     pub splunk_etc: PathBuf,
     /// Current app folder name (`myapp`), when known.
     pub app: Option<String>,
+    /// Splunk user name used for `etc/users/<user>/...` overlays.
+    ///
+    /// When `None`, user-local layers are skipped so a system process cannot
+    /// pick up another user's private settings.
+    pub user: Option<String>,
     pub hostname: String,
 }
 
@@ -52,6 +57,7 @@ impl ConfContext {
             splunk_db,
             splunk_etc,
             app: None,
+            user: None,
             hostname: crate::get_splunk_hostname::get_os_hostname(),
         }
     }
@@ -86,6 +92,9 @@ impl ConfContext {
             self.splunk_etc.display().to_string(),
         );
         vars.insert("HOSTNAME".to_string(), self.hostname.clone());
+        // Splunk's inputs.conf default `host = $decideOnStartup` means "use the
+        // hostname determined at process start", which we treat as OS hostname.
+        vars.insert("decideOnStartup".to_string(), self.hostname.clone());
         if let Some(app) = &self.app {
             vars.insert("APP".to_string(), app.clone());
         }
@@ -110,6 +119,9 @@ pub struct LayeredReadOptions {
     pub include_disabled_apps: bool,
     /// When set, only this app (plus system and matching user dirs) is read.
     pub app_filter: Option<String>,
+    /// When set, overlay that user's `etc/users/<user>/...` files. When `None`,
+    /// user-local layers are omitted (see [`ConfContext::user`]).
+    pub user: Option<String>,
 }
 
 impl Default for LayeredReadOptions {
@@ -119,6 +131,7 @@ impl Default for LayeredReadOptions {
             expand_variables: true,
             include_disabled_apps: false,
             app_filter: None,
+            user: None,
         }
     }
 }
@@ -145,8 +158,14 @@ impl LayeredConfig {
 }
 
 /// Read `conf_file_name` (e.g. `inputs.conf`) using default layering options.
+///
+/// User-local files are included only when [`ConfContext::user`] is set.
 pub fn read_layered_conf(ctx: &ConfContext, conf_file_name: &str) -> io::Result<LayeredConfig> {
-    read_layered_conf_with_options(ctx, conf_file_name, &LayeredReadOptions::default())
+    let options = LayeredReadOptions {
+        user: ctx.user.clone(),
+        ..LayeredReadOptions::default()
+    };
+    read_layered_conf_with_options(ctx, conf_file_name, &options)
 }
 
 /// Read and overlay a conf file using Splunk directory precedence.
@@ -155,14 +174,8 @@ pub fn read_layered_conf_with_options(
     conf_file_name: &str,
     options: &LayeredReadOptions,
 ) -> io::Result<LayeredConfig> {
-    let sources = collect_conf_sources(ctx, conf_file_name, options);
-    let mut dict = if sources.is_empty() {
-        let mut dict = Dictionary::new();
-        dict.insert("default".to_string(), HashMap::new());
-        dict
-    } else {
-        read_configs_last_wins(&sources)
-    };
+    let sources = collect_conf_sources(ctx, conf_file_name, options)?;
+    let mut dict = merge_configs_strict(&sources, MergePrecedence::LastWins)?;
 
     if options.inherit_default {
         inherit_default_stanza(&mut dict);
@@ -175,11 +188,14 @@ pub fn read_layered_conf_with_options(
 }
 
 /// List conf files in Splunk overlay order (lowest priority first).
+///
+/// Missing optional directories are ignored. Permission and other I/O errors
+/// are returned so a caller does not silently use a lower-priority layer.
 pub fn collect_conf_sources(
     ctx: &ConfContext,
     conf_file_name: &str,
     options: &LayeredReadOptions,
-) -> Vec<PathBuf> {
+) -> io::Result<Vec<PathBuf>> {
     let etc = &ctx.splunk_etc;
     let mut files = Vec::new();
 
@@ -187,21 +203,27 @@ pub fn collect_conf_sources(
         &mut files,
         &etc.join("system").join("default"),
         conf_file_name,
-    );
+    )?;
 
     let app_roots = [
         etc.join("apps"),
         etc.join("slave-apps"),
         etc.join("peer-apps"),
     ];
-    let layered_apps: Vec<Vec<AppMeta>> = app_roots
-        .iter()
-        .map(|root| list_app_dirs(root, options))
-        .collect();
+    let mut layered_apps = Vec::new();
+    for root in &app_roots {
+        layered_apps.push(list_app_dirs(root, options)?);
+    }
 
     for apps in &layered_apps {
         for app in apps {
-            push_if_file(&mut files, &app.path.join("default"), conf_file_name);
+            push_if_file(&mut files, &app.path.join("default"), conf_file_name)?;
+        }
+    }
+
+    for apps in &layered_apps {
+        for app in apps {
+            push_if_file(&mut files, &app.path.join("local"), conf_file_name)?;
         }
     }
 
@@ -209,16 +231,10 @@ pub fn collect_conf_sources(
         &mut files,
         &etc.join("system").join("local"),
         conf_file_name,
-    );
+    )?;
 
-    for apps in &layered_apps {
-        for app in apps {
-            push_if_file(&mut files, &app.path.join("local"), conf_file_name);
-        }
-    }
-
-    collect_user_confs(etc, conf_file_name, options, &mut files);
-    files
+    collect_user_confs(etc, conf_file_name, options, &mut files)?;
+    Ok(files)
 }
 
 /// Copy keys from `[default]` into every other stanza when absent.
@@ -336,11 +352,15 @@ fn app_name_from_dir(app_dir: &Path) -> Option<String> {
     Some(name.into_owned())
 }
 
-fn push_if_file(files: &mut Vec<PathBuf>, dir: &Path, conf_file_name: &str) {
+fn push_if_file(files: &mut Vec<PathBuf>, dir: &Path, conf_file_name: &str) -> io::Result<()> {
     let path = dir.join(conf_file_name);
-    if path.is_file() {
-        files.push(path);
+    match path.metadata() {
+        Ok(meta) if meta.is_file() => files.push(path),
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -350,15 +370,16 @@ struct AppMeta {
     priority: i64,
 }
 
-fn list_app_dirs(apps_root: &Path, options: &LayeredReadOptions) -> Vec<AppMeta> {
-    let Ok(entries) = fs::read_dir(apps_root) else {
-        return Vec::new();
+fn list_app_dirs(apps_root: &Path, options: &LayeredReadOptions) -> io::Result<Vec<AppMeta>> {
+    let entries = match fs::read_dir(apps_root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
     };
     let mut apps = Vec::new();
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
         if !file_type.is_dir() {
             continue;
         }
@@ -373,7 +394,7 @@ fn list_app_dirs(apps_root: &Path, options: &LayeredReadOptions) -> Vec<AppMeta>
             continue;
         }
         let path = entry.path();
-        let (enabled, priority) = read_app_install(&path);
+        let (enabled, priority) = read_app_install(&path)?;
         if !enabled && !options.include_disabled_apps {
             continue;
         }
@@ -388,37 +409,41 @@ fn list_app_dirs(apps_root: &Path, options: &LayeredReadOptions) -> Vec<AppMeta>
             .cmp(&b.priority)
             .then_with(|| a.name.cmp(&b.name))
     });
-    apps
+    Ok(apps)
 }
 
-fn read_app_install(app_dir: &Path) -> (bool, i64) {
+fn read_app_install(app_dir: &Path) -> io::Result<(bool, i64)> {
     let app_conf = app_dir.join("default").join("app.conf");
     let app_conf_local = app_dir.join("local").join("app.conf");
     let mut enabled = true;
     let mut priority = 0i64;
     for path in [&app_conf, &app_conf_local] {
-        if !path.is_file() {
-            continue;
-        }
-        let dict = splunk_config_processor::merge_configs(&[path], MergePrecedence::LastWins);
-        if let Some(install) = dict.get("install") {
-            if let Some(state) = install.get("state")
-                && state.eq_ignore_ascii_case("disabled")
-            {
-                enabled = false;
-            } else if let Some(state) = install.get("state")
-                && state.eq_ignore_ascii_case("enabled")
-            {
-                enabled = true;
+        match path.metadata() {
+            Ok(meta) if meta.is_file() => {
+                let dict = merge_configs_strict(&[path], MergePrecedence::LastWins)?;
+                if let Some(install) = dict.get("install") {
+                    if let Some(state) = install.get("state")
+                        && state.eq_ignore_ascii_case("disabled")
+                    {
+                        enabled = false;
+                    } else if let Some(state) = install.get("state")
+                        && state.eq_ignore_ascii_case("enabled")
+                    {
+                        enabled = true;
+                    }
+                    if let Some(value) = install.get("priority")
+                        && let Ok(parsed) = value.trim().parse::<i64>()
+                    {
+                        priority = parsed;
+                    }
+                }
             }
-            if let Some(value) = install.get("priority")
-                && let Ok(parsed) = value.trim().parse::<i64>()
-            {
-                priority = parsed;
-            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
         }
     }
-    (enabled, priority)
+    Ok((enabled, priority))
 }
 
 fn collect_user_confs(
@@ -426,37 +451,35 @@ fn collect_user_confs(
     conf_file_name: &str,
     options: &LayeredReadOptions,
     files: &mut Vec<PathBuf>,
-) {
-    let users_root = etc.join("users");
-    let Ok(users) = fs::read_dir(&users_root) else {
-        return;
+) -> io::Result<()> {
+    let Some(user) = options.user.as_deref().filter(|u| !u.is_empty()) else {
+        return Ok(());
     };
-    let mut user_dirs: Vec<PathBuf> = users
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .map(|e| e.path())
-        .collect();
-    user_dirs.sort();
-    for user_dir in user_dirs {
-        let Ok(apps) = fs::read_dir(&user_dir) else {
-            continue;
-        };
-        let mut app_dirs: Vec<PathBuf> = apps
-            .flatten()
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .map(|e| e.path())
-            .collect();
-        app_dirs.sort();
-        for app_dir in app_dirs {
-            if let Some(filter) = &options.app_filter {
-                let name = app_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name != filter {
-                    continue;
-                }
-            }
-            push_if_file(files, &app_dir.join("local"), conf_file_name);
+
+    let user_dir = etc.join("users").join(user);
+    let apps = match fs::read_dir(&user_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let mut app_dirs: Vec<PathBuf> = Vec::new();
+    for entry in apps {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            app_dirs.push(entry.path());
         }
     }
+    app_dirs.sort();
+    for app_dir in app_dirs {
+        if let Some(filter) = &options.app_filter {
+            let name = app_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name != filter {
+                continue;
+            }
+        }
+        push_if_file(files, &app_dir.join("local"), conf_file_name)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -547,6 +570,36 @@ mod tests {
     }
 
     #[test]
+    fn system_local_wins_over_app_local_for_global_settings() {
+        let (_dir, ctx) = fake_home();
+        write(
+            &ctx.splunk_etc
+                .join("system")
+                .join("local")
+                .join("inputs.conf"),
+            "[default]\nhost = system-local-host\n",
+        );
+        write(
+            &ctx.splunk_etc
+                .join("apps")
+                .join("myapp")
+                .join("local")
+                .join("inputs.conf"),
+            "[default]\nhost = app-local-host\n",
+        );
+
+        let layered = read_layered_conf(&ctx, "inputs.conf").unwrap();
+        assert_eq!(layered.value("default", "host"), Some("system-local-host"));
+    }
+
+    #[test]
+    fn expand_decide_on_startup_to_hostname() {
+        let mut vars = HashMap::new();
+        vars.insert("decideOnStartup".into(), "idx-01".into());
+        assert_eq!(expand_value("$decideOnStartup", &vars), "idx-01");
+    }
+
+    #[test]
     fn disabled_apps_are_skipped_and_priority_orders_overlay() {
         let (_dir, ctx) = fake_home();
         write(
@@ -607,6 +660,7 @@ mod tests {
     fn user_local_wins_and_variables_expand_per_stanza() {
         let (_dir, mut ctx) = fake_home();
         ctx.app = Some("search".into());
+        ctx.user = Some("admin".into());
         write(
             &ctx.splunk_etc
                 .join("system")
@@ -631,6 +685,15 @@ mod tests {
                 .join("indexes.conf"),
             "[netflow]\nmaxTotalDataSizeMB = 250\n",
         );
+        write(
+            &ctx.splunk_etc
+                .join("users")
+                .join("zzz")
+                .join("search")
+                .join("local")
+                .join("indexes.conf"),
+            "[netflow]\nmaxTotalDataSizeMB = 999\n",
+        );
 
         let layered = read_layered_conf(&ctx, "indexes.conf").unwrap();
         let expected = format!("{}/netflow/db", ctx.splunk_db.display());
@@ -639,6 +702,13 @@ mod tests {
             Some(expected.as_str())
         );
         assert_eq!(layered.value("netflow", "maxTotalDataSizeMB"), Some("250"));
+
+        ctx.user = None;
+        let without_user = read_layered_conf(&ctx, "indexes.conf").unwrap();
+        assert_eq!(
+            without_user.value("netflow", "maxTotalDataSizeMB"),
+            Some("100")
+        );
     }
 
     #[test]

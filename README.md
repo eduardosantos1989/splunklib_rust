@@ -133,13 +133,17 @@ splunk_config_processor::clear_cache();
 
 ### [`splunk_conf_layering`](lib/splunk_conf_layering.rs)
 
-Read a conf file the way Splunk does: overlay `system/default` → app `default/` →
-`system/local` → app `local/` → user `local`. Later layers win. `[default]` keys
-are inherited by other stanzas, then `$SPLUNK_HOME`, `$SPLUNK_DB`, `$SPLUNK_ETC`,
-`$APP`, `$HOSTNAME`, and `$_index_name` (the stanza name) are expanded.
+Read a conf file the way Splunk does for **global** settings: overlay
+`system/default` → app `default/` → app `local/` → `system/local`. Later layers
+win, so an administrator's `etc/system/local` setting is not overridden by an
+app. `[default]` keys are inherited by other stanzas, then `$SPLUNK_HOME`,
+`$SPLUNK_DB`, `$SPLUNK_ETC`, `$APP`, `$HOSTNAME`, `$decideOnStartup`, and
+`$_index_name` (the stanza name) are expanded.
 
-Disabled apps (`app.conf` `[install] state = disabled`) are skipped. App order is
-ASCII name order, with `[install] priority` applied later (higher wins).
+User-local files (`etc/users/<user>/...`) are applied only when
+`ConfContext.user` is set. Disabled apps (`app.conf` `[install] state = disabled`)
+are skipped. App order is ASCII name order, with `[install] priority` applied
+later (higher wins).
 
 ```rust
 use splunklib_rust::{read_layered_conf, ConfContext};
