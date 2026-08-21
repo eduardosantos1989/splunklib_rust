@@ -108,7 +108,7 @@ impl HttpLogConfig {
             token: None,
             verify_ssl: true,
             metadata: EventMetadata::new("main", "splunklib_rust", "_json", "localhost"),
-            gzip: true,
+            gzip: matches!(mode, IngestMode::SplunkHec),
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
         }
@@ -798,7 +798,11 @@ fn worker_loop(
             }
             Command::Flush(reply) => {
                 let mut result = flush_batch(&mut ctx);
-                if result.is_ok() {
+                if result.is_err() {
+                    // This explicit flush is returning the delivery error now;
+                    // do not report the same consumed batch again next time.
+                    ctx.pending_delivery_error = None;
+                } else {
                     if let Some(err) = ctx.pending_delivery_error.take() {
                         result = Err(err);
                     } else if let Some(file) = &ctx.file {
@@ -853,7 +857,9 @@ fn build_http_runtime(http_cfg: &HttpLogConfig) -> std::result::Result<HttpRunti
         .request_timeout(http_cfg.request_timeout)
         .enable_gzip(http_cfg.gzip, 1024)
         .ingest_mode(http_cfg.mode);
-    if let Some(token) = &http_cfg.token {
+    if matches!(http_cfg.mode, IngestMode::SplunkHec)
+        && let Some(token) = &http_cfg.token
+    {
         builder = builder.hec_token(token.clone());
     }
     let sender = runtime
@@ -876,7 +882,6 @@ fn flush_batch(ctx: &mut WorkerCtx) -> std::io::Result<()> {
         match send_result {
             Ok(_) => {
                 ctx.stats.http_batches_ok += 1;
-                ctx.pending_delivery_error = None;
                 Ok(())
             }
             Err(err) => {
@@ -1004,7 +1009,7 @@ mod tests {
             file: None,
             session_id: Some(1),
             queue_capacity: Some(16),
-            batch_size: 1,
+            batch_size: 16,
             auto_flush_interval: None,
         })
         .unwrap();
@@ -1014,7 +1019,16 @@ mod tests {
             matches!(err, JsonLoggerError::Io(_)),
             "flush should surface HTTP-only delivery failure, got {err:?}"
         );
+        logger
+            .flush()
+            .expect("the same consumed batch error must not be returned twice");
         let _ = logger.shutdown();
+    }
+
+    #[test]
+    fn gzip_defaults_only_for_splunk_hec() {
+        assert!(HttpLogConfig::new("https://hec.invalid", IngestMode::SplunkHec).gzip);
+        assert!(!HttpLogConfig::new("https://custom.invalid", IngestMode::Custom).gzip);
     }
 
     #[test]

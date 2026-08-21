@@ -7,15 +7,17 @@
 //! - Version extraction from .conf files
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env, fs, io,
     path::Path,
-    ptr::NonNull,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
+    time::SystemTime,
 };
+
+use tracing::warn;
 
 /// Stanza name (section header: "[name]")
 pub type Stanza = String;
@@ -113,57 +115,38 @@ fn mb_to_bytes_safe(mb: usize) -> usize {
 
 // ===== LRU Cache =====
 
-struct CacheNode {
-    key: String,
+struct CacheEntry {
     /// Content stored as Arc<String> to allow cheap cloning on cache hits.
     /// This avoids deep-copying large configuration file contents.
     content: Arc<String>,
-    prev: Option<NonNull<CacheNode>>,
-    next: Option<NonNull<CacheNode>>,
+    stamp: FileStamp,
 }
 
-impl CacheNode {
-    fn new(key: String, content: Arc<String>) -> Box<Self> {
-        Box::new(Self {
-            key,
-            content,
-            prev: None,
-            next: None,
-        })
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl FileStamp {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
     }
 }
 
 struct LRUCache {
-    head: NonNull<CacheNode>,
-    tail: NonNull<CacheNode>,
-    map: HashMap<String, NonNull<CacheNode>>,
+    map: HashMap<String, CacheEntry>,
+    /// Most recently used key at the front, least recently used at the back.
+    order: VecDeque<String>,
     total_size: usize,
     max_size: usize,
 }
 
 impl LRUCache {
     fn new() -> Self {
-        // Sentinel nodes (content is empty Arc, never accessed)
-        let mut head = Box::new(CacheNode {
-            key: String::new(),
-            content: Arc::new(String::new()),
-            prev: None,
-            next: None,
-        });
-        let mut tail = Box::new(CacheNode {
-            key: String::new(),
-            content: Arc::new(String::new()),
-            prev: None,
-            next: None,
-        });
-
-        let head_ptr = NonNull::from(&mut *head);
-        let tail_ptr = NonNull::from(&mut *tail);
-
-        // Link sentinels
-        head.next = Some(tail_ptr);
-        tail.prev = Some(head_ptr);
-
         let mut max_size = DEFAULT_CACHE_SIZE_MB * MB;
 
         // Read from environment with proper validation
@@ -174,113 +157,74 @@ impl LRUCache {
             max_size = mb_to_bytes_safe(mb);
         }
 
-        // Leak the sentinel nodes so they live for the static lifetime
-        let head_ptr = NonNull::from(Box::leak(head));
-        let tail_ptr = NonNull::from(Box::leak(tail));
-
         Self {
-            head: head_ptr,
-            tail: tail_ptr,
             map: HashMap::new(),
+            order: VecDeque::new(),
             total_size: 0,
             max_size,
         }
     }
 
-    fn add_front(&mut self, mut node: NonNull<CacheNode>) {
-        unsafe {
-            let head_next = self.head.as_ref().next.unwrap();
-            node.as_mut().next = Some(head_next);
-            node.as_mut().prev = Some(self.head);
-            head_next.as_ptr().as_mut().unwrap().prev = Some(node);
-            self.head.as_mut().next = Some(node);
+    fn touch(&mut self, key: &str) {
+        if let Some(position) = self.order.iter().position(|existing| existing == key) {
+            self.order.remove(position);
         }
+        self.order.push_front(key.to_string());
     }
 
-    fn unlink(node: NonNull<CacheNode>) {
-        unsafe {
-            let prev = node.as_ref().prev.unwrap();
-            let next = node.as_ref().next.unwrap();
-            prev.as_ptr().as_mut().unwrap().next = Some(next);
-            next.as_ptr().as_mut().unwrap().prev = Some(prev);
+    fn remove(&mut self, key: &str) -> Option<CacheEntry> {
+        if let Some(position) = self.order.iter().position(|existing| existing == key) {
+            self.order.remove(position);
         }
-    }
-
-    fn move_to_head(&mut self, node: NonNull<CacheNode>) {
-        Self::unlink(node);
-        self.add_front(node);
-    }
-
-    fn remove_last(&mut self) -> Option<Box<CacheNode>> {
-        unsafe {
-            let tail_prev = self.tail.as_ref().prev?;
-            if tail_prev == self.head {
-                return None;
-            }
-
-            Self::unlink(tail_prev);
-            let node = tail_prev.as_ref();
-            self.map.remove(&node.key);
-            self.total_size = self.total_size.saturating_sub(node.content.len());
-
-            Some(Box::from_raw(tail_prev.as_ptr()))
-        }
+        let entry = self.map.remove(key)?;
+        self.total_size = self.total_size.saturating_sub(entry.content.len());
+        Some(entry)
     }
 
     /// Get content from cache. Returns Arc<String> for cheap cloning.
-    fn get(&mut self, key: &str) -> Option<Arc<String>> {
-        if let Some(&node) = self.map.get(key) {
-            self.move_to_head(node);
-            // Arc::clone is O(1) - just increments reference count
-            unsafe { Some(Arc::clone(&node.as_ref().content)) }
-        } else {
-            None
+    fn get(&mut self, key: &str, stamp: FileStamp) -> Option<Arc<String>> {
+        let entry = self.map.get(key)?;
+        if entry.stamp != stamp {
+            self.remove(key);
+            return None;
         }
+        let content = Arc::clone(&entry.content);
+        self.touch(key);
+        Some(content)
     }
 
     /// Insert content into cache. Takes Arc<String> to share ownership.
-    fn insert(&mut self, key: String, content: Arc<String>) {
-        if let Some(&old_node) = self.map.get(&key) {
-            Self::unlink(old_node);
-            unsafe {
-                let old_node_ref = old_node.as_ref();
-                self.total_size = self.total_size.saturating_sub(old_node_ref.content.len());
-                let _ = Box::from_raw(old_node.as_ptr());
-            }
-            self.map.remove(&key);
-        }
+    fn insert(&mut self, key: String, content: Arc<String>, stamp: FileStamp) {
+        self.remove(&key);
 
         let content_len = content.len();
-        let node = CacheNode::new(key.clone(), content);
+        self.map.insert(key.clone(), CacheEntry { content, stamp });
+        self.touch(&key);
         self.total_size += content_len;
 
-        let node_ptr = NonNull::from(Box::leak(node));
-        self.map.insert(key, node_ptr);
-        self.add_front(node_ptr);
-
         while self.total_size > self.max_size && !self.map.is_empty() {
-            if let Some(old) = self.remove_last() {
-                drop(old);
+            if !self.remove_last() {
+                break;
             }
         }
+    }
+
+    fn remove_last(&mut self) -> bool {
+        let Some(key) = self.order.pop_back() else {
+            return false;
+        };
+        if let Some(entry) = self.map.remove(&key) {
+            self.total_size = self.total_size.saturating_sub(entry.content.len());
+        }
+        true
     }
 
     fn clear(&mut self) {
-        // Remove all nodes except sentinels
-        while self.remove_last().is_some() {}
+        self.map.clear();
+        self.order.clear();
+        self.total_size = 0;
     }
 }
-
-impl Drop for LRUCache {
-    fn drop(&mut self) {
-        self.clear();
-    }
-}
-
-// SAFETY: LRUCache is always protected by a Mutex when used in static context.
-// The raw pointers (NonNull) are managed internally and never escape the Mutex boundary.
-unsafe impl Send for LRUCache {}
-unsafe impl Sync for LRUCache {}
 
 // Global cache instance
 static CACHE: OnceLock<Mutex<LRUCache>> = OnceLock::new();
@@ -329,8 +273,8 @@ pub fn set_cache_size_mb(mb: usize) {
 
     // Evict if current size exceeds new limit
     while cache.total_size > cache.max_size && !cache.map.is_empty() {
-        if let Some(old) = cache.remove_last() {
-            drop(old);
+        if !cache.remove_last() {
+            break;
         }
     }
 }
@@ -361,14 +305,26 @@ fn read_file_view<P: AsRef<Path>>(path: P) -> Arc<String> {
 
     let abs_path = match fs::canonicalize(path_ref) {
         Ok(p) => p,
-        Err(_) => return empty_arc_string(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return empty_arc_string(),
+        Err(err) => {
+            warn!(path = %path_ref.display(), error = %err, "failed to canonicalize Splunk configuration file");
+            return empty_arc_string();
+        }
     };
     let key = normalize_path(&abs_path.to_string_lossy());
+    let metadata = match fs::metadata(&abs_path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            warn!(path = %abs_path.display(), error = %err, "failed to stat Splunk configuration file");
+            return empty_arc_string();
+        }
+    };
+    let stamp = FileStamp::from_metadata(&metadata);
 
     // Check cache with lock
     {
         let mut cache = get_cache().lock().unwrap();
-        if let Some(content) = cache.get(&key) {
+        if let Some(content) = cache.get(&key, stamp) {
             CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             // Arc::clone is O(1) - no deep copy
             return content;
@@ -380,8 +336,14 @@ fn read_file_view<P: AsRef<Path>>(path: P) -> Arc<String> {
 
     let content = match fs::read_to_string(&abs_path) {
         Ok(c) => c,
-        Err(_) => return empty_arc_string(),
+        Err(err) => {
+            warn!(path = %abs_path.display(), error = %err, "failed to read Splunk configuration file");
+            return empty_arc_string();
+        }
     };
+    let stamp = fs::metadata(&abs_path)
+        .map(|metadata| FileStamp::from_metadata(&metadata))
+        .unwrap_or(stamp);
 
     // Wrap in Arc for shared ownership between cache and return value.
     // No deep copy needed - Arc::clone just increments reference count.
@@ -389,7 +351,7 @@ fn read_file_view<P: AsRef<Path>>(path: P) -> Arc<String> {
     let result = Arc::clone(&content);
     {
         let mut cache = get_cache().lock().unwrap();
-        cache.insert(key, content);
+        cache.insert(key, content, stamp);
     }
 
     result
@@ -744,6 +706,45 @@ pub fn read_configs_default<P: AsRef<Path>>(files: &[P]) -> Dictionary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_lru_evicts_the_least_recently_used_entry() {
+        let stamp = FileStamp {
+            len: 3,
+            modified: None,
+        };
+        let mut cache = LRUCache {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            total_size: 0,
+            max_size: 6,
+        };
+        cache.insert("a".to_string(), Arc::new("aaa".to_string()), stamp);
+        cache.insert("b".to_string(), Arc::new("bbb".to_string()), stamp);
+        assert_eq!(
+            cache.get("a", stamp).as_deref().map(String::as_str),
+            Some("aaa")
+        );
+
+        cache.insert("c".to_string(), Arc::new("ccc".to_string()), stamp);
+        assert!(cache.get("b", stamp).is_none());
+        assert!(cache.get("a", stamp).is_some());
+        assert!(cache.get("c", stamp).is_some());
+    }
+
+    #[test]
+    fn cached_file_is_invalidated_when_size_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inputs.conf");
+        clear_cache();
+        fs::write(&path, "[default]\nhost = one\n").unwrap();
+        let first = read_configs_default(&[&path]);
+        assert_eq!(first["default"]["host"], "one");
+
+        fs::write(&path, "[default]\nhost = a-longer-value\n").unwrap();
+        let second = read_configs_default(&[&path]);
+        assert_eq!(second["default"]["host"], "a-longer-value");
+    }
 
     #[test]
     fn parse_config_handles_comments_stanzas_and_multiline() {

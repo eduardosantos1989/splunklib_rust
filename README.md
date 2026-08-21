@@ -27,7 +27,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-splunklib_rust = "0.3.0"
+splunklib_rust = "0.3.1"
 ```
 
 ## Modules
@@ -110,7 +110,7 @@ if let Some(default_stanza) = config.get("default") {
 - **Key-value pairs**: `key = value`
 - **Multiline values**: Continue with backslash (`\`)
 - **Comments**: Lines starting with `#` or `;`
-- **LRU caching**: Configurable cache size (default: 50MB)
+- **LRU caching**: Safe, configurable cache (default: 50MB) invalidated when file size or modification time changes
 - **Merge semantics**: [`read_configs`](lib/splunk_config_processor.rs) keeps first-wins
   (put `local/` first). Prefer [`read_layered_conf`](lib/splunk_conf_layering.rs) for
   Splunk's real default-then-local overlay.
@@ -142,8 +142,8 @@ app. `[default]` keys are inherited by other stanzas, then `$SPLUNK_HOME`,
 
 User-local files (`etc/users/<user>/...`) are applied only when
 `ConfContext.user` is set. Disabled apps (`app.conf` `[install] state = disabled`)
-are skipped. App order is ASCII name order, with `[install] priority` applied
-later (higher wins).
+are skipped. Apps are sorted by `[install] priority` ascending and then by
+ASCII name; later overlays win, so higher-priority apps override lower ones.
 
 ```rust
 use splunklib_rust::{read_layered_conf, ConfContext};
@@ -260,7 +260,7 @@ time=1735032800, sid=123456789, Application started successfully
 
 ### [`splunk_http_sender`](lib/splunk_http_sender.rs)
 
-Send events to Splunk HTTP Event Collector (HEC).
+Send events to Splunk HEC or Custom ingest collectors.
 
 ```rust
 use splunklib_rust::splunk_http_sender::{HttpEventSender, EventMetadata};
@@ -314,6 +314,9 @@ let sender = HttpEventSenderBuilder::new(
         "https://splunk:8088/services/collector/event"
     )
     .verify_ssl(true)
+    // Optional private trust root. When supplied, only certificates in this
+    // bundle are trusted for the sender.
+    .tls_ca_pem(std::fs::read("collector-ca.pem")?)
     .connect_timeout(Duration::from_secs(10))
     .request_timeout(Duration::from_secs(30))
     .enable_gzip(true, 1024) // Enable gzip for payloads >= 1024 bytes
@@ -333,6 +336,7 @@ let hec = HttpEventSenderBuilder::new("https://splunk:8088/services/collector/ev
     .build()
     .await?;
 hec.send_json_events(&metadata, &events).await?;
+// The legacy-named send_hec_events API also attaches this configured token.
 
 // Custom collector: no auth, JSON array body, metadata as query params
 let custom = HttpEventSenderBuilder::new("https://collector:8089/services/receivers/stream")
@@ -341,6 +345,10 @@ let custom = HttpEventSenderBuilder::new("https://collector:8089/services/receiv
     .await?;
 custom.send_json_events(&metadata, &events).await?;
 ```
+
+`hec_token` is emitted only for HEC-mode requests. Headers supplied through
+`extra_headers` are an explicit escape hatch and are sent in either ingest mode;
+callers are responsible for not attaching `Authorization` to Custom endpoints.
 
 ## Error Handling
 
@@ -394,6 +402,7 @@ for handle in handles {
 ### HTTP Sender
 
 - Enable gzip for large payloads (>= 1KB)
+- `JsonLogger` defaults gzip on for Splunk HEC and off for Custom ingest; override `gzip` only when the target collector supports it
 - Use [`send_events_batched`] for large event sets
 - Batch events to reduce HTTP overhead
 - Configure appropriate timeouts for your network
@@ -415,4 +424,3 @@ See `src/main.rs` for a JSON logger that writes NDJSON locally, or POSTs to
 ```bash
 cargo test
 ```
-

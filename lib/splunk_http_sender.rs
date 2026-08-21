@@ -882,7 +882,8 @@ impl HttpEventSender {
         }
 
         let bytes = Self::encode_hec_payload(events)?;
-        self.do_send(metadata, bytes, true).await
+        let url = self.build_url(metadata)?;
+        self.do_send_to_url(url, bytes, true, true).await
     }
 
     /// Clear response cache (useful for testing or memory management)
@@ -922,6 +923,7 @@ pub struct HttpEventSenderBuilder {
     logger: Option<Arc<dyn Logger>>,
     ingest_mode: IngestMode,
     hec_token: Option<String>,
+    tls_ca_pem: Option<Vec<u8>>,
 }
 
 impl HttpEventSenderBuilder {
@@ -938,6 +940,7 @@ impl HttpEventSenderBuilder {
             logger: None,
             ingest_mode: IngestMode::Custom,
             hec_token: None,
+            tls_ca_pem: None,
         }
     }
 
@@ -990,10 +993,20 @@ impl HttpEventSenderBuilder {
         self
     }
 
+    /// Trust only the CA certificates in this PEM bundle for TLS connections.
+    ///
+    /// Supplying an explicit private CA disables the platform and built-in root
+    /// stores for this sender. This prevents an internal collector endpoint from
+    /// also being trusted through an unrelated public CA.
+    pub fn tls_ca_pem(mut self, pem: impl AsRef<[u8]>) -> Self {
+        self.tls_ca_pem = Some(pem.as_ref().to_vec());
+        self
+    }
+
     pub async fn build(self) -> Result<HttpEventSender> {
         let base_url = Url::parse(&self.url)?;
 
-        let client = ClientBuilder::new()
+        let mut client_builder = ClientBuilder::new()
             .danger_accept_invalid_certs(!self.verify_ssl)
             .danger_accept_invalid_hostnames(!self.verify_ssl)
             .tcp_keepalive(Duration::from_secs(60))
@@ -1001,8 +1014,17 @@ impl HttpEventSenderBuilder {
             .timeout(self.request_timeout)
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(10)
-            .user_agent("SplunkEventSender-Rust/1.0")
-            .build()?;
+            .user_agent("SplunkEventSender-Rust/1.0");
+        if let Some(pem) = self.tls_ca_pem {
+            let certificates = reqwest::Certificate::from_pem_bundle(&pem)?;
+            if certificates.is_empty() {
+                return Err(SplunkError::ConfigError(
+                    "TLS CA PEM bundle did not contain a certificate".to_string(),
+                ));
+            }
+            client_builder = client_builder.tls_certs_only(certificates);
+        }
+        let client = client_builder.build()?;
 
         let extra_headers = self.extra_headers;
 
@@ -1035,6 +1057,7 @@ impl HttpEventSenderBuilder {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn send_events_batched_rejects_zero_batch_size() {
@@ -1113,5 +1136,35 @@ mod tests {
         sender.set_ingest_mode(IngestMode::Custom).await;
         let still_custom = sender.get_headers(true, false, false).await.unwrap();
         assert!(still_custom.get(reqwest::header::AUTHORIZATION).is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_send_hec_events_attaches_hec_auth() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 8192];
+            let count = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request[..count]).into_owned()
+        });
+
+        let sender = HttpEventSenderBuilder::new(format!("http://{address}/collector"))
+            .hec_token("secret-token")
+            .build()
+            .await
+            .unwrap();
+        let metadata = EventMetadata::new("main", "src", "st", "host");
+        sender
+            .send_hec_events(&metadata, &[json!({"event": "hello"})])
+            .await
+            .unwrap();
+
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("authorization: splunk secret-token\r\n"));
     }
 }

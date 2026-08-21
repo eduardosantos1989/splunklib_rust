@@ -9,8 +9,8 @@
 //! 4. `etc/system/local` (highest *global* precedence)
 //! 5. `etc/users/<user>/<app>/local` (only when a user is selected)
 //!
-//! Apps are applied in ASCII name order, with `[install] priority` in `app.conf`
-//! as a tie-break (higher priority is applied later and therefore wins). Apps
+//! Apps are sorted by `[install] priority` ascending and then by ASCII name;
+//! later overlays win, so a higher-priority app overrides a lower-priority app. Apps
 //! with `[install] state = disabled` are skipped unless requested.
 //!
 //! After the overlay, `[default]` keys are copied into other stanzas when
@@ -379,8 +379,8 @@ fn list_app_dirs(apps_root: &Path, options: &LayeredReadOptions) -> io::Result<V
     let mut apps = Vec::new();
     for entry in entries {
         let entry = entry?;
-        let file_type = entry.file_type()?;
-        if !file_type.is_dir() {
+        let path = entry.path();
+        if !path.is_dir() {
             continue;
         }
         let name = entry.file_name();
@@ -393,7 +393,6 @@ fn list_app_dirs(apps_root: &Path, options: &LayeredReadOptions) -> io::Result<V
         {
             continue;
         }
-        let path = entry.path();
         let (enabled, priority) = read_app_install(&path)?;
         if !enabled && !options.include_disabled_apps {
             continue;
@@ -465,7 +464,7 @@ fn collect_user_confs(
     let mut app_dirs: Vec<PathBuf> = Vec::new();
     for entry in apps {
         let entry = entry?;
-        if entry.file_type()?.is_dir() {
+        if entry.path().is_dir() {
             app_dirs.push(entry.path());
         }
     }
