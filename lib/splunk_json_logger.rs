@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(not(target_has_atomic = "64"))]
 use portable_atomic::AtomicU64;
-use rand::Rng;
+use rand::RngExt;
 #[cfg(target_has_atomic = "64")]
 use std::sync::atomic::AtomicU64;
 
