@@ -6,10 +6,11 @@ A high-performance Rust library for integrating with Splunk, providing utilities
 
 `splunklib_rust` is a comprehensive Rust library for Splunk integration, designed for use in Splunk apps and external applications. It provides:
 
-- **Splunk Location Detection**: Automatically discover Splunk installation paths
-- **Configuration Processing**: Parse and cache Splunk .conf files with full spec support
-- **File Logger**: High-performance, thread-safe logging with rotation and batching
-- **HTTP Event Sender**: Send events to Splunk HEC with gzip compression and batching
+- **Splunk Location Detection**: `SPLUNK_HOME`, then install-layout detection
+- **Layered configuration**: btool-style overlay, `[default]` inheritance, `$SPLUNK_HOME` / `$SPLUNK_DB` / `$_index_name`
+- **JSON logger**: HTTP when a collector URL is set (Splunk HEC or custom), otherwise rotating NDJSON files
+- **File Logger**: Thread-safe logging with rotation and batching
+- **HTTP Event Sender**: Splunk HEC envelopes or a custom no-auth JSON-array endpoint
 
 ## Features
 
@@ -26,7 +27,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-splunklib_rust = "0.2.0"
+splunklib_rust = "0.3.0"
 ```
 
 ## Modules
@@ -46,7 +47,9 @@ println!("Hostname: {}", hostname);
 
 ### [`get_splunk_location`](lib/get_splunk_location.rs)
 
-Detect Splunk installation directory structure.
+Detect Splunk installation directory structure. `SPLUNK_HOME` wins when set;
+otherwise the crate walks up from the current executable looking for `etc/system`
+and `bin`.
 
 ```rust
 use splunklib_rust::get_splunk_location;
@@ -108,7 +111,9 @@ if let Some(default_stanza) = config.get("default") {
 - **Multiline values**: Continue with backslash (`\`)
 - **Comments**: Lines starting with `#` or `;`
 - **LRU caching**: Configurable cache size (default: 50MB)
-- **Merge semantics**: Earlier files override later ones (like Splunk)
+- **Merge semantics**: [`read_configs`](lib/splunk_config_processor.rs) keeps first-wins
+  (put `local/` first). Prefer [`read_layered_conf`](lib/splunk_conf_layering.rs) for
+  Splunk's real default-then-local overlay.
 
 #### Cache Management
 
@@ -125,6 +130,85 @@ println!("Cache hits: {}, misses: {}", stats.hits, stats.misses);
 // Clear cache
 splunk_config_processor::clear_cache();
 ```
+
+### [`splunk_conf_layering`](lib/splunk_conf_layering.rs)
+
+Read a conf file the way Splunk does for **global** settings: overlay
+`system/default` → app `default/` → app `local/` → `system/local`. Later layers
+win, so an administrator's `etc/system/local` setting is not overridden by an
+app. `[default]` keys are inherited by other stanzas, then `$SPLUNK_HOME`,
+`$SPLUNK_DB`, `$SPLUNK_ETC`, `$APP`, `$HOSTNAME`, `$decideOnStartup`, and
+`$_index_name` (the stanza name) are expanded.
+
+User-local files (`etc/users/<user>/...`) are applied only when
+`ConfContext.user` is set. Disabled apps (`app.conf` `[install] state = disabled`)
+are skipped. App order is ASCII name order, with `[install] priority` applied
+later (higher wins).
+
+```rust
+use splunklib_rust::{read_layered_conf, ConfContext};
+
+let ctx = ConfContext::from_splunk_home("/opt/splunk");
+let inputs = read_layered_conf(&ctx, "inputs.conf")?;
+if let Some(host) = inputs.value("default", "host") {
+    println!("Host: {host}");
+}
+```
+
+### [`splunk_json_logger`](lib/splunk_json_logger.rs)
+
+JSON logging from the start. If an HTTP endpoint is configured, records are
+batched and POSTed; otherwise they are written as NDJSON to a rotating file.
+When both are set, HTTP is primary and the file is the fallback if a send fails.
+
+Use [`IngestMode`](lib/splunk_http_sender.rs) to pick the wire format:
+
+- `IngestMode::SplunkHec` — standard HEC: `Authorization: Splunk <token>` and
+  concatenated event envelopes
+- `IngestMode::Custom` — custom collector (no auth): JSON array body with
+  index/source/sourcetype/host as query parameters
+
+```rust
+use splunklib_rust::splunk_file_logger::FileLoggerConfig;
+use splunklib_rust::splunk_json_logger::{HttpLogConfig, JsonLogger, JsonLoggerConfig};
+use splunklib_rust::IngestMode;
+
+let file = FileLoggerConfig::new("/opt/splunk/var/log/splunk/myapp.log");
+
+// HTTP when a collector exists, file otherwise / on send failure
+let http = HttpLogConfig::new(
+    "https://splunk:8088/services/collector/event",
+    IngestMode::SplunkHec,
+)
+.with_token("00000000-0000-0000-0000-000000000000");
+
+let logger = JsonLogger::new(JsonLoggerConfig::http_with_file_fallback(http, file))?;
+logger.info("application started")?;
+logger.log_json(serde_json::json!({"event": "login", "user": "alice"}))?;
+logger.flush()?;
+```
+
+Or load destination and ingest mode from a layered Splunk conf (`[logging]` or
+`[http::...]`):
+
+```ini
+[logging]
+ingest = custom
+url = https://collector.example:8089/services/receivers/stream
+file = $SPLUNK_HOME/var/log/splunk/myapp.log
+index = main
+sourcetype = _json
+```
+
+```rust
+use splunklib_rust::{ConfContext, JsonLogger};
+
+let ctx = ConfContext::from_env()?;
+let logger = JsonLogger::from_splunk_conf(&ctx, "logger.conf")?;
+```
+
+Set `ingest = hec` plus `token` for standard HEC, `ingest = custom` for the
+no-auth JSON-array collector, or `ingest = file` to force file-only logging.
 
 ### [`splunk_file_logger`](lib/splunk_file_logger.rs)
 
@@ -237,14 +321,25 @@ let sender = HttpEventSenderBuilder::new(
     .await?;
 ```
 
-#### Authentication
+#### Authentication and ingest mode
 
 ```rust
-// Add HEC token
-sender.add_extra_header(
-    "Authorization".to_string(),
-    "Splunk <your-hec-token>".to_string()
-).await;
+use splunklib_rust::splunk_http_sender::{HttpEventSenderBuilder, IngestMode};
+
+// Standard Splunk HEC
+let hec = HttpEventSenderBuilder::new("https://splunk:8088/services/collector/event")
+    .ingest_mode(IngestMode::SplunkHec)
+    .hec_token("your-hec-token")
+    .build()
+    .await?;
+hec.send_json_events(&metadata, &events).await?;
+
+// Custom collector: no auth, JSON array body, metadata as query params
+let custom = HttpEventSenderBuilder::new("https://collector:8089/services/receivers/stream")
+    .ingest_mode(IngestMode::Custom)
+    .build()
+    .await?;
+custom.send_json_events(&metadata, &events).await?;
 ```
 
 ## Error Handling
@@ -311,7 +406,9 @@ for handle in handles {
 
 ## Examples
 
-See `src/main.rs` for a complete example demonstrating file logger usage.
+See `src/main.rs` for a JSON logger that writes NDJSON locally, or POSTs to
+`SPLUNK_LOG_URL` when set (`SPLUNK_LOG_INGEST=hec|custom`, optional
+`SPLUNK_HEC_TOKEN`).
 
 ## Testing
 

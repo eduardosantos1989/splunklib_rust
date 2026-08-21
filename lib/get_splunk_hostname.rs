@@ -1,36 +1,25 @@
 //! Hostname retrieval utilities for Splunk.
 //!
-//! This module provides functions to retrieve hostnames from Splunk configuration
-//! files, with graceful fallback to the system hostname.
+//! Looks up hostname through layered Splunk configuration (`inputs.conf` then
+//! `server.conf`), falling back to the system hostname.
 
 use std::io;
 use std::path::Path;
 
+use crate::splunk_conf_layering::{ConfContext, read_layered_conf};
+
 /// Retrieve the hostname from Splunk configuration, falling back to system hostname.
 ///
-/// This function attempts to get the hostname from Splunk's configuration files
-/// (inputs.conf and server.conf) in the local directory. If that fails, it falls
-/// back to the system hostname.
-///
-/// # Priority order:
-/// 1. `inputs.conf` stanza `[default]` key `host`
-/// 2. `server.conf` stanza `[general]` key `serverName`
+/// Priority:
+/// 1. Layered `inputs.conf` stanza `[default]` key `host`
+/// 2. Layered `server.conf` stanza `[general]` key `serverName`
 /// 3. System hostname
-///
-/// # Arguments
-///
-/// `splunk_root` - Path to the Splunk installation root directory.
-/// If empty or invalid, system hostname is returned.
-///
-/// # Returns
-///
-/// The hostname as a String.
 ///
 /// # Examples
 ///
 /// ```rust,no_run
 /// use std::path::Path;
-/// use splunklib_rust::get_splunk_hostname::get_splunk_hostname;
+/// use splunklib_rust::get_splunk_hostname;
 ///
 /// let hostname = get_splunk_hostname(Path::new("/opt/splunk"));
 /// println!("Hostname: {}", hostname);
@@ -43,66 +32,108 @@ pub fn get_splunk_hostname(splunk_root: &Path) -> String {
 }
 
 /// Try to retrieve hostname from Splunk configuration files.
-///
-/// Returns an error if configuration files are not accessible.
-/// On success, returns the hostname found in config or system hostname as fallback.
-///
-/// # Arguments
-///
-/// * `splunk_root` - Path to the Splunk installation root directory.
-///
-/// # Returns
-///
-/// `io::Result<String>` - The hostname or an I/O error.
 pub fn try_get_splunk_hostname(splunk_root: &Path) -> io::Result<String> {
-    let local_dir = if splunk_root.as_os_str().is_empty() {
+    if splunk_root.as_os_str().is_empty() {
         return Ok(get_os_hostname());
-    } else {
-        splunk_root.join("etc").join("system").join("local")
-    };
-
-    // Read both config files in one pass
-    let config_files = [local_dir.join("inputs.conf"), local_dir.join("server.conf")];
-
-    let mut existing_files = Vec::new();
-    for f in &config_files {
-        if f.try_exists()? {
-            existing_files.push(f);
-        }
     }
 
-    if !existing_files.is_empty() {
-        let dict = crate::splunk_config_processor::read_configs_default(&existing_files);
+    let ctx = ConfContext::from_splunk_home(splunk_root);
 
-        // Check inputs.conf first
-        if let Some(stanza) = dict.get("default")
-            && let Some(host) = stanza.get("host")
-        {
-            return Ok(host.clone());
-        }
-
-        // Check server.conf
-        if let Some(stanza) = dict.get("general")
-            && let Some(server_name) = stanza.get("serverName")
-        {
-            return Ok(server_name.clone());
-        }
+    let inputs = read_layered_conf(&ctx, "inputs.conf")?;
+    if let Some(host) = inputs
+        .value("default", "host")
+        .filter(|h| is_usable_hostname(h))
+    {
+        return Ok(host.to_string());
     }
 
-    // Fallback to system hostname
+    let server = read_layered_conf(&ctx, "server.conf")?;
+    if let Some(server_name) = server
+        .value("general", "serverName")
+        .filter(|h| is_usable_hostname(h))
+    {
+        return Ok(server_name.to_string());
+    }
+
     Ok(get_os_hostname())
 }
 
+fn is_usable_hostname(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && !trimmed.eq_ignore_ascii_case("$decideOnStartup")
+        && trimmed != "${decideOnStartup}"
+}
+
 /// Get the system hostname using the OS hostname facility.
-///
-/// This function retrieves the system hostname and falls back to "localhost"
-/// if the hostname cannot be determined.
-///
-/// # Returns
-///
-/// The system hostname as a String, or "localhost" if unavailable.
 pub fn get_os_hostname() -> String {
     hostname::get()
         .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "localhost".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn hostname_prefers_layered_inputs_default_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_dir = dir.path().join("etc/system/default");
+        let local_dir = dir.path().join("etc/system/local");
+        fs::create_dir_all(&default_dir).unwrap();
+        fs::create_dir_all(&local_dir).unwrap();
+        fs::write(
+            default_dir.join("inputs.conf"),
+            "[default]\nhost = from-default\n",
+        )
+        .unwrap();
+        fs::write(
+            local_dir.join("inputs.conf"),
+            "[default]\nhost = from-local\n",
+        )
+        .unwrap();
+
+        let hostname = try_get_splunk_hostname(dir.path()).unwrap();
+        assert_eq!(hostname, "from-local");
+    }
+
+    #[test]
+    fn hostname_falls_back_to_server_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_dir = dir.path().join("etc/system/default");
+        fs::create_dir_all(&default_dir).unwrap();
+        fs::write(
+            default_dir.join("server.conf"),
+            "[general]\nserverName = idx-01\n",
+        )
+        .unwrap();
+
+        let hostname = try_get_splunk_hostname(dir.path()).unwrap();
+        assert_eq!(hostname, "idx-01");
+    }
+
+    #[test]
+    fn decide_on_startup_is_not_returned_as_hostname() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_dir = dir.path().join("etc/system/default");
+        fs::create_dir_all(&default_dir).unwrap();
+        fs::write(
+            default_dir.join("inputs.conf"),
+            "[default]\nhost = $decideOnStartup\n",
+        )
+        .unwrap();
+        fs::write(
+            default_dir.join("server.conf"),
+            "[general]\nserverName = idx-from-server\n",
+        )
+        .unwrap();
+
+        let hostname = try_get_splunk_hostname(dir.path()).unwrap();
+        assert_ne!(hostname, "$decideOnStartup");
+        // Expanded sentinel becomes the OS hostname; serverName is only used
+        // when host is unset.
+        assert_eq!(hostname, get_os_hostname());
+    }
 }
